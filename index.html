@@ -756,7 +756,7 @@ function queueZoom(amount,x,y){
 canvas.addEventListener('wheel',event=>{
   event.preventDefault();
   const unit=event.deltaMode===1?16:event.deltaMode===2?canvas.clientHeight:1;
-  queueZoom(-event.deltaY*unit*(event.ctrlKey?.009:.0025),event.clientX,event.clientY);
+  queueZoom(-event.deltaY*unit*(event.ctrlKey?.009:.00125),event.clientX,event.clientY);
 },{passive:false});
 const pointers=new Map();let pinch=0;
 const prevent=event=>{if(event.cancelable)event.preventDefault();};
