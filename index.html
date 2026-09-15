@@ -253,6 +253,7 @@ uniform int uFirst;
 uniform int uFinal;
 uniform int uCount;
 uniform int uStorageGamma;
+uniform float uDepthScale;
 uniform vec4 uLayer[16]; // fractional world center, inverse cell scale, cell pixels
 uniform uvec3 uIndex[16]; // absolute cell indices modulo 2^32, absolute level
 
@@ -425,6 +426,9 @@ void main(){
   }
   // RGBA8 works without floating-point framebuffer extensions, on mobile too.
   O=vec4(uvec4(first,first>>8u,first>>16u,first>>24u)&uvec4(255u))/255.;
+  // Quarter/three-quarter batch offsets leave a conservative rounding margin.
+  // The regular color shader never writes depth, allowing early hardware tests.
+  gl_FragDepth=(float(first/16u)+.25)*uDepthScale;
 #else
   uint first=0u;
   if(uUseCoverage==1){
@@ -466,17 +470,21 @@ void main(){
 #endif
 }
 `;
+function createCarpetEngine(canvas,options){
 const VERT=`#version 300 es
 layout(location=0) in vec2 aPosition;
-void main(){gl_Position=vec4(aPosition,0,1);}`;
+uniform float uPassDepth;
+void main(){gl_Position=vec4(aPosition,uPassDepth*2.-1.,1);}`;
 // FRAG and embedded image data are supplied by the standalone HTML build.
-const canvas=document.getElementById('gl');
-const fail=document.getElementById('fail');
-const loader=document.getElementById('loader');
-const debug=new URLSearchParams(location.search).get('debug')==='1';
+const debug=!!options.debug;
 const camera=new CarpetCamera();
 let gl,program,uniforms,targets=[],carpetTexture,wallTexture;
 let constantTargets=[],constantAttempted=false;
+const prefixCache=[];
+const CACHE_LIMIT=128;
+let cacheRevision=0,cacheHits=0,depthBuffer=null,depthAttempted=false;
+const frameFences=[];
+let fenceHead=0,fenceCount=0,queueEnabled=true,blockedFrames=0;
 let coverageProgram,coverageUniforms,sceneTexture;
 let width=0,height=0,fit=1,ready=false,lost=false,needsResize=false;
 let requestedWidth=0,requestedHeight=0,maxWidth=0,maxHeight=0;
@@ -486,18 +494,20 @@ const BATCH=16;
 const COVERAGE_FROM=24,SEARCH_LAYERS=32;
 const GPU_INTERRUPTED=Symbol('GPU interrupted');
 let gpuGeneration=0,presentation=0,firstFrame=true;
-const MIN_LOADING_MS=3000;
-let loaderElapsed=0,loaderClock=0,loaderRunning=false;
-function startLoaderClock(){loaderElapsed=0;loaderClock=performance.now();loaderRunning=!document.hidden;}
-function updateLoaderClock(now){
-  if(loaderRunning)loaderElapsed+=Math.max(0,now-loaderClock);
-  loaderClock=now;loaderRunning=!document.hidden;
+let view=options.view,paused=options.visible===false,disposed=false;
+const stats={constantBatches:0,cacheHits:0,hardwareCulling:false,blockedFrames:0};
+const requestAnimationFrame=options.requestFrame||globalThis.requestAnimationFrame.bind(globalThis);
+const cancelAnimationFrame=options.cancelFrame||globalThis.cancelAnimationFrame.bind(globalThis);
+function snapshot(){return {x:camera.x,y:camera.y,bits:camera.bits,z:camera.z,targetZoom,velocity,anchorX,anchorY};}
+if(options.snapshot){
+  const saved=options.snapshot;
+  camera.x=saved.x;camera.y=saved.y;camera.bits=saved.bits;camera.z=saved.z;
+  targetZoom=saved.targetZoom;velocity=saved.velocity;anchorX=saved.anchorX;anchorY=saved.anchorY;
 }
-
 function showError(message){
-  ready=false;cancelAnimationFrame(raf);raf=0;
-  cancelAnimationFrame(presentation);presentation=0;
-  fail.textContent=message;fail.hidden=false;
+  if(disposed)return;
+  ready=false;cancelAnimationFrame(raf);raf=0;cancelAnimationFrame(presentation);presentation=0;
+  options.error?.(message,snapshot());
 }
 const nextFrame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 function shader(type,source){
@@ -550,7 +560,7 @@ async function initGPU(generation){
   const position=gl.getAttribLocation(program,'aPosition');
   gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
   uniforms={};
-  for(const name of ['uRes','uRoot','uCarpet','uWall','uPrevious','uCoverage','uUseCoverage','uFirst','uFinal','uCount','uStorageGamma','uLayer[0]','uIndex[0]'])
+  for(const name of ['uRes','uRoot','uCarpet','uWall','uPrevious','uCoverage','uUseCoverage','uFirst','uFinal','uCount','uStorageGamma','uLayer[0]','uIndex[0]','uPassDepth'])
     uniforms[name]=gl.getUniformLocation(program,name);
   gl.uniform1i(uniforms.uCarpet,0);gl.uniform1i(uniforms.uWall,1);gl.uniform1i(uniforms.uPrevious,2);
   gl.uniform1i(uniforms.uCoverage,3);
@@ -558,7 +568,7 @@ async function initGPU(generation){
   gl.activeTexture(gl.TEXTURE1);wallTexture=texture(imageWall);
   if(coverageProgram){
     coverageUniforms={};
-    for(const name of ['uRes','uRoot','uCarpet','uScene','uTotal'])coverageUniforms[name]=gl.getUniformLocation(coverageProgram,name);
+    for(const name of ['uRes','uRoot','uCarpet','uScene','uTotal','uDepthScale'])coverageUniforms[name]=gl.getUniformLocation(coverageProgram,name);
     gl.useProgram(coverageProgram);
     gl.uniform1i(coverageUniforms.uCarpet,0);gl.uniform1i(coverageUniforms.uScene,4);
     sceneTexture=gl.createTexture();gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,sceneTexture);
@@ -575,13 +585,83 @@ async function initGPU(generation){
   maxWidth=Math.min(maxTexture,maxBuffer,viewport[0]);
   maxHeight=Math.min(maxTexture,maxBuffer,viewport[1]);
   targets=[];constantTargets=[];constantAttempted=false;
+  prefixCache.length=0;cacheRevision=0;depthBuffer=null;depthAttempted=false;
+  frameFences.length=0;fenceHead=fenceCount=0;queueEnabled=true;
   width=height=requestedWidth=requestedHeight=0;resize();
   gl.disable(gl.DITHER);gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);
 }
 function deleteTargets(){
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
   for(const t of [...targets,...constantTargets]){gl.deleteFramebuffer(t.fbo);gl.deleteTexture(t.texture);}
+  for(const t of prefixCache)if(t){gl.deleteFramebuffer(t.fbo);gl.deleteTexture(t.texture);}
+  prefixCache.length=0;cacheRevision=0;
+  if(depthBuffer)gl.deleteRenderbuffer(depthBuffer);
+  depthBuffer=null;depthAttempted=false;
   targets=[];constantTargets=[];constantAttempted=false;
+}
+function ensureDepthBuffer(){
+  if(depthAttempted)return !!depthBuffer;
+  depthAttempted=true;
+  const buffer=gl.createRenderbuffer();if(!buffer)return false;
+  gl.bindRenderbuffer(gl.RENDERBUFFER,buffer);
+  gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT24,width,height);
+  let complete=true;
+  for(const target of targets){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,target.fbo);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,buffer);
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)complete=false;
+  }
+  if(complete)depthBuffer=buffer;
+  else{
+    for(const target of targets){
+      gl.bindFramebuffer(gl.FRAMEBUFFER,target.fbo);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,null);
+    }
+    gl.deleteRenderbuffer(buffer);
+  }
+  gl.bindRenderbuffer(gl.RENDERBUFFER,null);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  return complete;
+}
+function cachedTarget(pass){
+  if(pass in prefixCache)return prefixCache[pass];
+  const texture=gl.createTexture();gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,texture);
+  gl.texImage2D(gl.TEXTURE_2D,0,floatTargets?gl.RGBA16F:gl.RGBA8,1,1,0,gl.RGBA,floatTargets?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const fbo=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);
+  let entry=null;
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE)
+    entry={texture,fbo,values:new Float32Array(BATCH*4),indices:new Uint32Array(BATCH*3),root:new Float32Array(3),parent:-1,revision:0};
+  else{gl.deleteFramebuffer(fbo);gl.deleteTexture(texture);}
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.bindTexture(gl.TEXTURE_2D,null);
+  prefixCache[pass]=entry;return entry;
+}
+function cacheMatches(entry,parent,x,y,inv){
+  if(!entry.revision||entry.parent!==parent||!Object.is(entry.root[0],Math.fround(x))||
+     !Object.is(entry.root[1],Math.fround(y))||!Object.is(entry.root[2],Math.fround(inv)))return false;
+  for(let i=0;i<layerData.length;i++)if(!Object.is(entry.values[i],layerData[i]))return false;
+  for(let i=0;i<indexData.length;i++)if(entry.indices[i]!==indexData[i])return false;
+  return true;
+}
+function gpuCanSubmit(){
+  while(fenceCount){
+    const sync=frameFences[fenceHead],status=gl.clientWaitSync(sync,0,0);
+    if(status===gl.TIMEOUT_EXPIRED)break;
+    gl.deleteSync(sync);frameFences[fenceHead]=null;fenceHead=(fenceHead+1)%2;fenceCount--;
+    if(status===gl.WAIT_FAILED){
+      while(fenceCount){gl.deleteSync(frameFences[fenceHead]);frameFences[fenceHead]=null;fenceHead=(fenceHead+1)%2;fenceCount--;}
+      queueEnabled=false;break;
+    }
+  }
+  if(fenceCount===2){blockedFrames++;return false;}
+  return true;
+}
+function gpuSubmitted(){
+  if(!queueEnabled)return;
+  const sync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);
+  if(!sync){queueEnabled=false;return;}
+  frameFences[(fenceHead+fenceCount)%2]=sync;fenceCount++;gl.flush();
 }
 function ensureConstantTargets(){
   if(constantAttempted)return constantTargets.length===2;
@@ -631,8 +711,8 @@ function allocateTargets(){
   return true;
 }
 function resize(){
-  const cssWidth=Math.max(1,canvas.clientWidth),cssHeight=Math.max(1,canvas.clientHeight);
-  const ratio=Math.min(devicePixelRatio||1,3,maxWidth/cssWidth,maxHeight/cssHeight);
+  const cssWidth=Math.max(1,view.width),cssHeight=Math.max(1,view.height);
+  const ratio=Math.min(view.dpr||1,3,maxWidth/cssWidth,maxHeight/cssHeight);
   const wantedWidth=Math.max(1,Math.min(maxWidth,Math.round(cssWidth*ratio)));
   const wantedHeight=Math.max(1,Math.min(maxHeight,Math.round(cssHeight*ratio)));
   if(wantedWidth===requestedWidth&&wantedHeight===requestedHeight)return;
@@ -680,6 +760,8 @@ function draw(){
   const rootInv=Math.exp(-camera.z)/fit;
   const compact=constantPrefix(layers,rootX,rootY,rootInv);
   const accelerated=!!coverageProgram&&layers.length>=COVERAGE_FROM;
+  const hardware=accelerated&&passes<1000000&&ensureDepthBuffer();
+  cacheHits=0;
   if(accelerated){
     const count=Math.min(SEARCH_LAYERS,12+Math.floor((layers.length-COVERAGE_FROM)/4));
     const start=layers.length-count;
@@ -696,7 +778,10 @@ function draw(){
     gl.uniform2f(coverageUniforms.uRes,width,height);
     gl.uniform3f(coverageUniforms.uRoot,rootX,rootY,rootInv);
     gl.uniform1i(coverageUniforms.uTotal,count);
+    gl.uniform1f(coverageUniforms.uDepthScale,1/(passes+1));
+    if(hardware){gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.ALWAYS);gl.depthMask(true);}
     gl.bindFramebuffer(gl.FRAMEBUFFER,targets[2].fbo);gl.drawArrays(gl.TRIANGLES,0,3);
+    if(hardware){gl.depthFunc(gl.GEQUAL);gl.depthMask(false);}
     gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,targets[2].texture);
     gl.useProgram(program);
   }else{
@@ -706,18 +791,16 @@ function draw(){
   gl.uniform1i(uniforms.uUseCoverage,accelerated&&!compact?1:0);
   gl.uniform2f(uniforms.uRes,width,height);
   gl.uniform3f(uniforms.uRoot,rootX,rootY,rootInv);
-  if(compact)gl.viewport(0,0,1,1);
+  if(compact){gl.viewport(0,0,1,1);gl.disable(gl.DEPTH_TEST);}
+  let previous=carpetTexture,parentRevision=0,cacheAllowed=true;
   for(let pass=0;pass<passes;pass++){
     const small=pass<compact;
     // Compute the complete constant ancestry. A later pixel's occlusion mask
     // must never determine the shared basis of other pixels.
     if(compact&&pass===compact){
       gl.viewport(0,0,width,height);gl.uniform1i(uniforms.uUseCoverage,accelerated?1:0);
+      if(hardware)gl.enable(gl.DEPTH_TEST);
     }
-    // The destination and source are always different; never a framebuffer feedback loop.
-    gl.bindFramebuffer(gl.FRAMEBUFFER,(small?constantTargets:targets)[pass%2].fbo);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D,pass===0?carpetTexture:(pass<=compact?constantTargets:targets)[(pass-1)%2].texture);
     const count=Math.min(BATCH,Math.max(0,layers.length-pass*BATCH));
     for(let j=0;j<count;j++){
       const a=layers[pass*BATCH+j];
@@ -725,54 +808,61 @@ function draw(){
       layerData[l]=a.x;layerData[l+1]=a.y;layerData[l+2]=a.inv;layerData[l+3]=a.px;
       indexData[k]=a.ix;indexData[k+1]=a.iy;indexData[k+2]=a.level;
     }
+    const entry=small&&cacheAllowed&&pass<CACHE_LIMIT?cachedTarget(pass):null;
+    if(entry&&cacheMatches(entry,parentRevision,rootX,rootY,rootInv)){
+      previous=entry.texture;parentRevision=entry.revision;cacheHits++;continue;
+    }
+    if(!entry)cacheAllowed=false;
+    const destination=entry||(small?constantTargets:targets)[pass%2];
+    // Cache entries have their own 1x1 targets; no source is overwritten.
+    gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,previous);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,destination.fbo);
+    gl.uniform1f(uniforms.uPassDepth,(pass+.75)/(passes+1));
     gl.uniform4fv(uniforms['uLayer[0]'],layerData);
     gl.uniform3uiv(uniforms['uIndex[0]'],indexData);
     gl.uniform1i(uniforms.uCount,count);
     gl.uniform1i(uniforms.uFirst,pass===0?1:0);
     gl.uniform1i(uniforms.uFinal,0);
     gl.drawArrays(gl.TRIANGLES,0,3);
+    if(entry){
+      entry.values.set(layerData);entry.indices.set(indexData);
+      entry.root[0]=rootX;entry.root[1]=rootY;entry.root[2]=rootInv;
+      entry.parent=parentRevision;entry.revision=++cacheRevision;parentRevision=entry.revision;
+    }
+    previous=destination.texture;
   }
   // Every composition (including the very first) takes the same storage path.
   // Adding an empty batch cannot introduce a new quantization or gamma step.
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.disable(gl.DEPTH_TEST);gl.depthMask(true);
   if(compact&&passes<=compact)gl.viewport(0,0,width,height);
   gl.activeTexture(gl.TEXTURE2);
-  gl.bindTexture(gl.TEXTURE_2D,(passes<=compact?constantTargets:targets)[(passes-1)%2].texture);
+  gl.bindTexture(gl.TEXTURE_2D,previous);
   gl.uniform1i(uniforms.uUseCoverage,0);
   gl.uniform1i(uniforms.uFirst,0);gl.uniform1i(uniforms.uCount,0);gl.uniform1i(uniforms.uFinal,1);
   gl.drawArrays(gl.TRIANGLES,0,3);
-  if(debug){
-    canvas.dataset.zoom=String(camera.z);
-    canvas.dataset.precision=String(camera.bits);
-    canvas.dataset.constantBatches=String(compact);
-  }
+  stats.constantBatches=compact;stats.cacheHits=cacheHits;
+  stats.hardwareCulling=hardware;stats.blockedFrames=blockedFrames;
 }
 function revealWhenRendered(){
   firstFrame=false;
   const generation=gpuGeneration,sync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);
-  let rendered=false;
   gl.flush();
-  const wait=now=>{
+  const wait=()=>{
     presentation=0;
-    if(lost||generation!==gpuGeneration)return;
-    updateLoaderClock(now);
-    if(!rendered){
-      if(sync&&gl.clientWaitSync(sync,0,0)===gl.TIMEOUT_EXPIRED){presentation=requestAnimationFrame(wait);return;}
-      if(sync)gl.deleteSync(sync);rendered=true;
-    }
-    if(loaderElapsed<MIN_LOADING_MS||document.hidden){presentation=requestAnimationFrame(wait);return;}
-    // Reveal only after a complete GPU frame, with one paint opportunity.
-    presentation=requestAnimationFrame(()=>{
-      presentation=0;if(lost||generation!==gpuGeneration)return;
-      loader.dataset.ready='1';loader.setAttribute('aria-hidden','true');
-    });
+    if(disposed||lost||generation!==gpuGeneration)return;
+    if(sync&&gl.clientWaitSync(sync,0,0)===gl.TIMEOUT_EXPIRED){presentation=requestAnimationFrame(wait);return;}
+    if(sync)gl.deleteSync(sync);options.rendered?.();
   };
   presentation=requestAnimationFrame(wait);
 }
-function wake(){if(ready&&!lost&&!raf){lastTime=performance.now();raf=requestAnimationFrame(frame);}}
-function frame(now){
-  raf=0;if(lost||!ready)return;
+
+function wake(){if(ready&&!lost&&!paused&&!disposed&&!raf){lastTime=performance.now();raf=requestAnimationFrame(frame);}}
+function advanceFrame(now){
+  raf=0;if(lost||!ready||paused||disposed)return;
+  const canSubmit=gpuCanSubmit();
   if(needsResize){
+    if(!canSubmit){lastTime=now;raf=requestAnimationFrame(frame);return;}
     needsResize=false;
     try{resize();}catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось изменить размер изображения. Перезагрузите страницу.');}return;}
   }
@@ -785,23 +875,243 @@ function frame(now){
     camera.zoomTo(next,(anchorX-.5)*width,(.5-anchorY)*height,fit);
     velocity=v;dirty=true;
   }
-  if(dirty){draw();dirty=false;if(firstFrame)revealWhenRendered();}
-  if(moving)raf=requestAnimationFrame(frame);
+  if(dirty&&canSubmit){draw();gpuSubmitted();options.state?.(snapshot(),stats);dirty=false;if(firstFrame)revealWhenRendered();}
+  if(moving||dirty)raf=requestAnimationFrame(frame);
 }
 function queueZoom(amount,x,y){
   if(!ready||lost||!Number.isFinite(amount))return;
-  const rect=canvas.getBoundingClientRect();
-  anchorX=Math.min(1,Math.max(0,(x-rect.left)/rect.width));
-  anchorY=Math.min(1,Math.max(0,(y-rect.top)/rect.height));
+  anchorX=Math.min(1,Math.max(0,x));anchorY=Math.min(1,Math.max(0,y));
   // Bound backlog, not total zoom. Large wheel bursts cannot queue minutes of travel.
   targetZoom=Math.max(0,Math.min(camera.z+Math.log(24),Math.max(camera.z-Math.log(24),targetZoom+amount)));
   wake();
 }
-canvas.addEventListener('wheel',event=>{
-  event.preventDefault();
-  const unit=event.deltaMode===1?16:event.deltaMode===2?canvas.clientHeight:1;
-  queueZoom(-event.deltaY*unit*(event.ctrlKey?.009:.00125),event.clientX,event.clientY);
-},{passive:false});
+
+function frame(now){
+  try{advanceFrame(now);}catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось нарисовать ковёр.');}}
+}
+function changeView(next){view=next;needsResize=true;wake();}
+function visible(value){
+  paused=!value;
+  if(paused){cancelAnimationFrame(raf);raf=0;}
+  else{needsResize=true;wake();}
+}
+canvas.addEventListener('webglcontextlost',event=>{
+  event.preventDefault();if(disposed)return;
+  lost=true;ready=false;gpuGeneration++;
+  cancelAnimationFrame(raf);raf=0;cancelAnimationFrame(presentation);presentation=0;firstFrame=true;
+  options.lost?.(snapshot());
+});
+canvas.addEventListener('webglcontextrestored',async()=>{
+  if(disposed)return;
+  try{lost=false;await initGPU(++gpuGeneration);if(disposed)return;ready=true;dirty=true;options.ready?.();wake();}
+  catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось восстановить изображение.');}}
+});
+async function start(){
+  try{
+    [imageCarpet,imageWall]=options.images;
+    gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:'high-performance'});
+    if(!gl){showError('Для ковра нужен браузер с поддержкой WebGL 2.');return;}
+    await initGPU(++gpuGeneration);if(disposed)return;
+    ready=true;dirty=true;options.ready?.();wake();
+  }catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось открыть ковёр. Попробуйте перезагрузить страницу.');}}
+}
+function dispose(){
+  disposed=true;ready=false;gpuGeneration++;
+  cancelAnimationFrame(raf);cancelAnimationFrame(presentation);raf=presentation=0;
+  if(gl&&!lost){
+    while(fenceCount){gl.deleteSync(frameFences[fenceHead]);fenceHead=(fenceHead+1)%2;fenceCount--;}
+    deleteTargets();gl.deleteProgram(program);if(coverageProgram)gl.deleteProgram(coverageProgram);
+    gl.deleteTexture(carpetTexture);gl.deleteTexture(wallTexture);if(sceneTexture)gl.deleteTexture(sceneTexture);
+  }
+}
+return {start,zoom:queueZoom,resize:changeView,visible,snapshot,dispose,
+  inputs(values){for(let i=0;i<values.length;i+=3)queueZoom(values[i],values[i+1],values[i+2]);}};
+
+}
+
+function carpetWorker(){
+  let engine=null,appliedBatch=0;
+  // Worker RAF is tied to the transferred canvas's visible document. Older
+  // implementations can expose the method but reject it; keep a timer fallback.
+  const callbacks=new Map();let serial=0;
+  function requestFrame(fn){
+    const id=++serial;
+    const invoke=now=>{callbacks.delete(id);fn(now);};
+    if(typeof self.requestAnimationFrame==='function'){
+      try{callbacks.set(id,{raf:self.requestAnimationFrame(invoke)});return id;}catch{}
+    }
+    callbacks.set(id,{timer:setTimeout(()=>invoke(performance.now()),1000/60)});return id;
+  }
+  function cancelFrame(id){
+    const handle=callbacks.get(id);if(!handle)return;callbacks.delete(id);
+    if(handle.raf!==undefined)self.cancelAnimationFrame(handle.raf);else clearTimeout(handle.timer);
+  }
+  const report=(type,extra={})=>postMessage({type,batch:appliedBatch,...extra});
+  self.onmessage=async({data})=>{
+    try{
+      if(data.type==='probe'){
+        const probe=new OffscreenCanvas(1,1),gl=probe.getContext('webgl2',{alpha:false,antialias:false});
+        const supported=!!gl;gl?.getExtension('WEBGL_lose_context')?.loseContext();
+        report('probe',{supported});return;
+      }
+      if(data.type==='init'){
+        engine=createCarpetEngine(data.canvas,{
+          images:data.images,view:data.view,visible:data.visible,debug:data.debug,snapshot:data.snapshot,
+          requestFrame,cancelFrame,
+          ready:()=>report('ready'),rendered:()=>report('rendered'),
+          lost:state=>report('lost',{state}),state:(state,stats)=>report('state',{state,stats}),
+          error:(message,state)=>report('failed',{message,state})
+        });
+        await engine.start();return;
+      }
+      if(data.type==='controls'&&engine){
+        // Process every signed delta in order; merging opposite wheel events
+        // would change the original per-event zoom-backlog clamp.
+        if(data.view)engine.resize(data.view);
+        if(data.visible!==null)engine.visible(data.visible);
+        engine.inputs(data.events);appliedBatch=data.id;
+        report('ack',{id:data.id,state:engine.snapshot()});
+      }
+    }catch(error){
+      if(data.type==='probe')report('probe',{supported:false});
+      else report('failed',{message:String(error),state:engine?.snapshot()});
+    }
+  };
+}
+
+let canvas=document.getElementById('gl');
+const loader=document.getElementById('loader'),fail=document.getElementById('fail');
+const debug=new URLSearchParams(location.search).get('debug')==='1';
+let activeEngine=null,renderWorker=null,backendReady=false,mode='starting',transferred=false;
+let imageCarpet,imageWall,lastSnapshot=null,lastAppliedBatch=0;
+let inflight=null,pendingEvents=[],pendingView=null,pendingVisible=null,batchSerial=0;
+let startingMain=false,backendGeneration=0;
+let presentation=0,loaderElapsed=0,loaderClock=0,loaderRunning=false,gpuRendered=false;
+const MIN_LOADING_MS=3000;
+const nextFrame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+function view(){return {width:Math.max(1,canvas.clientWidth),height:Math.max(1,canvas.clientHeight),dpr:devicePixelRatio||1};}
+function startLoaderClock(){loaderElapsed=0;loaderClock=performance.now();loaderRunning=!document.hidden;}
+function updateLoaderClock(now){
+  if(loaderRunning)loaderElapsed+=Math.max(0,now-loaderClock);
+  loaderClock=now;loaderRunning=!document.hidden;
+}
+function beginLoading(){
+  gpuRendered=false;cancelAnimationFrame(presentation);presentation=0;startLoaderClock();
+  loader.dataset.ready='0';loader.setAttribute('aria-hidden','false');
+}
+function reveal(){
+  if(!gpuRendered||presentation)return;
+  const wait=now=>{
+    presentation=0;updateLoaderClock(now);if(!gpuRendered)return;
+    if(loaderElapsed<MIN_LOADING_MS||document.hidden){presentation=requestAnimationFrame(wait);return;}
+    presentation=requestAnimationFrame(()=>{
+      presentation=0;
+      if(!gpuRendered||document.hidden){reveal();return;}
+      loader.dataset.ready='1';loader.setAttribute('aria-hidden','true');
+    });
+  };
+  presentation=requestAnimationFrame(wait);
+}
+function showError(message){
+  backendReady=false;gpuRendered=false;cancelAnimationFrame(presentation);presentation=0;
+  fail.textContent=message;fail.hidden=false;
+}
+function receivedState(state,stats,batch=lastAppliedBatch){
+  if(state){lastSnapshot=state;lastAppliedBatch=batch;}
+  if(debug&&state){
+    canvas.dataset.zoom=String(state.z);canvas.dataset.precision=String(state.bits);canvas.dataset.renderer=mode;
+    if(stats){
+      canvas.dataset.constantBatches=String(stats.constantBatches);canvas.dataset.cacheHits=String(stats.cacheHits);
+      canvas.dataset.hardwareCulling=String(stats.hardwareCulling);canvas.dataset.blockedFrames=String(stats.blockedFrames);
+    }
+  }
+}
+function onLost(state){
+  receivedState(state);backendReady=false;resetGestures();pendingEvents.length=0;beginLoading();
+}
+function onReady(){backendReady=true;fail.hidden=true;flushControls();}
+function flushControls(){
+  if(!backendReady)return;
+  if(mode==='main'){
+    if(pendingView)activeEngine.resize(pendingView);
+    if(pendingVisible!==null)activeEngine.visible(pendingVisible);
+    activeEngine.inputs(pendingEvents);pendingEvents.length=0;pendingView=null;pendingVisible=null;return;
+  }
+  if(!renderWorker||inflight||(!pendingEvents.length&&!pendingView&&pendingVisible===null))return;
+  const message={type:'controls',id:++batchSerial,events:pendingEvents,view:pendingView,visible:pendingVisible};
+  pendingEvents=[];pendingView=null;pendingVisible=null;inflight=message;
+  try{renderWorker.postMessage(message);}catch(error){void launchMain();}
+}
+function queueZoom(amount,x,y){
+  if(!backendReady||!Number.isFinite(amount))return;
+  const rect=canvas.getBoundingClientRect();
+  const nx=Math.min(1,Math.max(0,(x-rect.left)/rect.width)),ny=Math.min(1,Math.max(0,(y-rect.top)/rect.height));
+  if(mode==='main')activeEngine.zoom(amount,nx,ny);
+  else{pendingEvents.push(amount,nx,ny);flushControls();}
+}
+async function launchMain(){
+  if(startingMain||mode==='main')return;
+  startingMain=true;backendReady=false;backendGeneration++;
+  renderWorker?.terminate();renderWorker=null;
+  // Replay only an unacknowledged batch that is newer than the saved camera.
+  if(inflight&&inflight.id>lastAppliedBatch)pendingEvents=inflight.events.concat(pendingEvents);
+  inflight=null;
+  if(transferred){
+    beginLoading();
+    const replacement=canvas.cloneNode(false);canvas.replaceWith(replacement);canvas=replacement;
+    transferred=false;bindCanvas();
+  }
+  mode='main';
+  activeEngine=createCarpetEngine(canvas,{
+    images:[imageCarpet,imageWall],view:view(),visible:!document.hidden,debug,snapshot:lastSnapshot,
+    ready:onReady,rendered:()=>{gpuRendered=true;reveal();},lost:onLost,
+    state:(state,stats)=>receivedState(state,stats),error:(message,state)=>{receivedState(state);showError(message);}
+  });
+  await activeEngine.start();startingMain=false;
+}
+async function launchWorker(){
+  if(typeof Worker!=='function'||typeof canvas.transferControlToOffscreen!=='function'||typeof createImageBitmap!=='function')return false;
+  const generation=++backendGeneration;
+  let worker,url,probeResolve,probeTimer;
+  try{
+    const source='"use strict";const LN2=Math.LN2;\n'+CarpetCamera.toString()+'\n'+spring.toString()+
+      '\nconst FRAG='+JSON.stringify(FRAG)+';\n'+createCarpetEngine.toString()+'\n('+carpetWorker.toString()+')();';
+    url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    worker=new Worker(url);renderWorker=worker;
+    const probed=new Promise(resolve=>{probeResolve=resolve;probeTimer=setTimeout(()=>resolve(false),5000);});
+    worker.onmessage=({data})=>{
+      if(generation!==backendGeneration)return;
+      if(data.type==='probe'){probeResolve(data.supported);return;}
+      if(data.state)receivedState(data.state,data.stats,data.batch);
+      if(data.type==='ready')onReady();
+      else if(data.type==='rendered'){gpuRendered=true;reveal();}
+      else if(data.type==='lost')onLost(data.state);
+      else if(data.type==='ack'){
+        if(inflight?.id===data.id)inflight=null;
+        flushControls();
+      }else if(data.type==='failed'){void launchMain();}
+    };
+    worker.onerror=event=>{
+      event.preventDefault?.();if(generation!==backendGeneration)return;
+      if(mode==='starting')probeResolve(false);else void launchMain();
+    };
+    worker.onmessageerror=()=>{if(generation===backendGeneration)void launchMain();};
+    worker.postMessage({type:'probe'});
+    const supported=await probed;clearTimeout(probeTimer);URL.revokeObjectURL(url);url=null;
+    if(!supported)throw new Error('Worker WebGL unavailable');
+    const options={imageOrientation:'none',premultiplyAlpha:'none',colorSpaceConversion:'none'};
+    const images=await Promise.all([createImageBitmap(imageCarpet,options),createImageBitmap(imageWall,options)]);
+    if(generation!==backendGeneration){for(const image of images)image.close();return true;}
+    const offscreen=canvas.transferControlToOffscreen();transferred=true;mode='worker';
+    worker.postMessage({type:'init',canvas:offscreen,images,view:view(),visible:!document.hidden,debug,snapshot:lastSnapshot},[offscreen,...images]);
+    return true;
+  }catch(error){
+    clearTimeout(probeTimer);if(url)URL.revokeObjectURL(url);worker?.terminate();
+    if(renderWorker===worker)renderWorker=null;
+    return false;
+  }
+}
+
 const pointers=new Map();let pinch=0;
 const prevent=event=>{if(event.cancelable)event.preventDefault();};
 function trackPinch(a,b,moving){
@@ -814,84 +1124,63 @@ function pointerPinch(moving){
   const values=pointers.values();trackPinch(values.next().value,values.next().value,moving);
 }
 function resetGestures(){pointers.clear();pinch=0;}
-if('PointerEvent' in globalThis){
-  canvas.addEventListener('pointerdown',event=>{
-    if(event.pointerType==='mouse')return;
-    prevent(event);
-    pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
-    // Capture is optional: window listeners still receive uncaptured movements.
-    try{canvas.setPointerCapture(event.pointerId);}catch{}
-    pointerPinch(false);
+const release=event=>{if(pointers.delete(event.pointerId))pointerPinch(false);};
+function bindCanvas(){
+  canvas.addEventListener('wheel',event=>{
+    event.preventDefault();const unit=event.deltaMode===1?16:event.deltaMode===2?canvas.clientHeight:1;
+    queueZoom(-event.deltaY*unit*(event.ctrlKey?.009:.00125),event.clientX,event.clientY);
   },{passive:false});
+  if('PointerEvent' in globalThis){
+    canvas.addEventListener('pointerdown',event=>{
+      if(event.pointerType==='mouse')return;
+      prevent(event);pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      try{canvas.setPointerCapture(event.pointerId);}catch{}
+      pointerPinch(false);
+    },{passive:false});
+    canvas.addEventListener('lostpointercapture',release);
+  }else{
+    const touch=(event,moving)=>{
+      prevent(event);if(event.touches.length!==2){pinch=0;return;}
+      const [a,b]=event.touches;
+      trackPinch({x:a.clientX,y:a.clientY},{x:b.clientX,y:b.clientY},moving);
+    };
+    canvas.addEventListener('touchstart',event=>touch(event,false),{passive:false});
+    canvas.addEventListener('touchmove',event=>touch(event,true),{passive:false});
+    for(const name of ['touchend','touchcancel'])canvas.addEventListener(name,event=>touch(event,false),{passive:false});
+  }
+  for(const name of ['gesturestart','gesturechange','gestureend'])canvas.addEventListener(name,prevent,{passive:false});
+}
+bindCanvas();
+if('PointerEvent' in globalThis){
   addEventListener('pointermove',event=>{
     const point=pointers.get(event.pointerId);if(!point)return;
     prevent(event);point.x=event.clientX;point.y=event.clientY;pointerPinch(true);
   },{passive:false});
-  const release=event=>{if(pointers.delete(event.pointerId))pointerPinch(false);};
   for(const name of ['pointerup','pointercancel'])addEventListener(name,release);
-  canvas.addEventListener('lostpointercapture',release);
-}else{
-  const touch= (event,moving)=>{
-    prevent(event);
-    if(event.touches.length!==2){pinch=0;return;}
-    const [a,b]=event.touches;
-    trackPinch({x:a.clientX,y:a.clientY},{x:b.clientX,y:b.clientY},moving);
-  };
-  canvas.addEventListener('touchstart',event=>touch(event,false),{passive:false});
-  canvas.addEventListener('touchmove',event=>touch(event,true),{passive:false});
-  for(const name of ['touchend','touchcancel'])canvas.addEventListener(name,event=>touch(event,false),{passive:false});
 }
-// Safari can otherwise apply its page magnification in addition to our pinch.
-for(const name of ['gesturestart','gesturechange','gestureend'])canvas.addEventListener(name,prevent,{passive:false});
-function requestResize(){needsResize=true;wake();}
-addEventListener('resize',requestResize);
-globalThis.visualViewport?.addEventListener('resize',requestResize);
-addEventListener('blur',resetGestures);
-addEventListener('pagehide',resetGestures);
-addEventListener('pageshow',requestResize);
+function requestResize(){pendingView=view();flushControls();}
+addEventListener('resize',requestResize);globalThis.visualViewport?.addEventListener('resize',requestResize);
+addEventListener('blur',resetGestures);addEventListener('pagehide',resetGestures);
+addEventListener('pageshow',()=>{pendingVisible=!document.hidden;requestResize();});
 document.addEventListener('visibilitychange',()=>{
-  updateLoaderClock(performance.now());
-  if(document.hidden){resetGestures();cancelAnimationFrame(raf);raf=0;}else requestResize();
+  updateLoaderClock(performance.now());if(document.hidden)resetGestures();
+  pendingVisible=!document.hidden;pendingView=view();flushControls();reveal();
 });
-canvas.addEventListener('webglcontextlost',event=>{
-  event.preventDefault();lost=true;ready=false;gpuGeneration++;
-  resetGestures();cancelAnimationFrame(raf);raf=0;
-  cancelAnimationFrame(presentation);presentation=0;firstFrame=true;
-  startLoaderClock();
-  loader.dataset.ready='0';loader.setAttribute('aria-hidden','false');
-});
-canvas.addEventListener('webglcontextrestored',async()=>{
-  try{lost=false;fail.hidden=true;await initGPU(++gpuGeneration);ready=true;dirty=true;wake();}
-  catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось восстановить изображение. Перезагрузите страницу.');}}
-});
+
 async function loadImage(id){
   const image=new Image();
-  const loaded=new Promise((resolve,reject)=>{
-    image.onload=resolve;image.onerror=()=>reject(new Error('Image failed: '+id));
-  });
-  // The loader's SVG image and the artwork share the same embedded HD photo.
-  const source=document.getElementById(id);
-  image.src=source.getAttribute?.('href')||source.textContent.trim();
+  const loaded=new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=()=>reject(new Error('Image failed: '+id));});
+  const source=document.getElementById(id);image.src=source.getAttribute?.('href')||source.textContent.trim();
   await loaded;
-  if(image.decode){
-    try{await image.decode();}catch(error){if(!image.complete||!image.naturalWidth)throw error;}
-  }
-  image.onload=image.onerror=null;
-  return image;
+  if(image.decode){try{await image.decode();}catch(error){if(!image.complete||!image.naturalWidth)throw error;}}
+  image.onload=image.onerror=null;return image;
 }
 (async()=>{
   try{
-    // Two animation frames give the mask a paint before any blocking GPU work.
-    const painted=(async()=>{
-      // The fixed vector lettering needs no font download or decoding.
-      await nextFrame();await nextFrame();startLoaderClock();
-    })();
+    const painted=(async()=>{await nextFrame();await nextFrame();startLoaderClock();})();
     [imageCarpet,imageWall]=await Promise.all([loadImage('carpet-data'),loadImage('wall-data'),painted]);
-    gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:'high-performance'});
-    if(!gl){showError('Для ковра нужен браузер с поддержкой WebGL 2.');return;}
-    // No placeholder frame: both photographs exist before the first draw.
-    await initGPU(++gpuGeneration);ready=true;dirty=true;wake();
-  }catch(error){if(error!==GPU_INTERRUPTED){console.error(error);showError('Не удалось открыть ковёр. Попробуйте перезагрузить страницу.');}}
+    if(!await launchWorker())await launchMain();
+  }catch(error){console.error(error);showError('Не удалось открыть ковёр. Попробуйте перезагрузить страницу.');}
 })();
 
 </script>
