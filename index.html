@@ -240,10 +240,12 @@ precision highp int;
 out vec4 O;
 uniform vec2 uRes;
 uniform vec3 uRoot; // center.xy, inverse world scale
-uniform sampler2D uCarpet;
-uniform sampler2D uWall;
-uniform sampler2D uPrevious;
-uniform sampler2D uCoverage;
+// Samplers default to lowp, even with highp float above. Keep interpolated
+// colors precise before dye/opacity reconstruction, which amplifies rounding.
+uniform highp sampler2D uCarpet;
+uniform highp sampler2D uWall;
+uniform highp sampler2D uPrevious;
+uniform highp sampler2D uCoverage;
 uniform highp usampler2D uScene;
 uniform int uTotal;
 uniform int uUseCoverage;
@@ -299,11 +301,30 @@ float edge(vec2 p){
   float ripple=.0014*sin(p.y*71.)+.0008*sin(p.y*159.+p.x*53.);
   return min(1.5-abs(p.x),1.-abs(p.y))+ripple;
 }
+// At extreme magnification the hardware filter's finite subtexel steps become
+// screen-sized blocks, then dye() amplifies them. Read the same four source
+// pixels and interpolate in highp instead. Retain mipmaps for small motifs;
+// the gradual handover avoids a sampling change on a particular zoom frame.
+vec3 carpetPhoto(vec2 uv,vec2 dx,vec2 dy,float footprint){
+  if(footprint>=.25)return textureGrad(uCarpet,uv,dx,dy).rgb;
+  ivec2 size=textureSize(uCarpet,0);
+  // Match MIRRORED_REPEAT, including the half texel at each outside edge.
+  if(any(lessThan(uv,vec2(0)))||any(greaterThan(uv,vec2(1))))
+    uv=1.-abs(mod(uv,2.)-1.);
+  vec2 pixel=uv*vec2(size)-.5;
+  ivec2 at=ivec2(floor(pixel));vec2 f=fract(pixel);
+  ivec2 a=clamp(at,ivec2(0),size-1),b=clamp(at+1,ivec2(0),size-1);
+  vec3 top=mix(texelFetch(uCarpet,a,0).rgb,texelFetch(uCarpet,ivec2(b.x,a.y),0).rgb,f.x);
+  vec3 bottom=mix(texelFetch(uCarpet,ivec2(a.x,b.y),0).rgb,texelFetch(uCarpet,b,0).rgb,f.x);
+  vec3 precise=mix(top,bottom,f.y);
+  if(footprint<=.125)return precise;
+  return mix(precise,textureGrad(uCarpet,uv,dx,dy).rgb,smoothstep(.125,.25,footprint));
+}
 vec3 rootColor(vec2 p){
   vec2 uv=vec2(p.x/3.+.5,.5-p.y*.5);
   vec2 dx=vec2(uRoot.z/3.,0),dy=vec2(0,-uRoot.z*.5);
-  vec3 photo=textureGrad(uCarpet,uv,dx,dy).rgb;
   float sourceHeight=float(textureSize(uCarpet,0).y);
+  vec3 photo=carpetPhoto(uv,dx,dy,sourceHeight*.5*uRoot.z);
   return linearColor(dye(photo,1./max(sourceHeight*.5*uRoot.z,1e-30)));
 }
 
@@ -363,8 +384,8 @@ bool detail(inout vec3 col,vec2 p,uvec2 absolute,uint lev,float inv,float px,boo
       vec2 uv=at+q*.5*flip*span;
       vec2 dx=(rotation*vec2(inv,0))/radius*.5*flip*span;
       vec2 dy=(rotation*vec2(0,inv))/radius*.5*flip*span;
-      vec3 tex=textureGrad(uCarpet,uv,dx,dy).rgb;
       float footprint=max(length(dx*sourceSize),length(dy*sourceSize));
+      vec3 tex=carpetPhoto(uv,dx,dy,footprint);
       vec3 pigment=dye(tex,1./max(footprint,1e-30));
       float field=smoothstep(1.60,2.65,pigment.r/(pigment.g+.025))*smoothstep(.15,.35,pigment.r);
       float support=1.-smoothstep(.85,1.,shape);
